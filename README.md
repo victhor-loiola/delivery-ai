@@ -1,424 +1,174 @@
-# Delivery Order System
+# delivery-ai
 
-Sistema de pedidos para delivery em Java e Spring Boot, desenvolvido como projeto de portfólio em AI Engineering. O repositório reúne um API Gateway, cinco serviços Java e um serviço Python de roteamento.
+Sistema de pedidos para delivery feito com microsserviços em Java e Spring Boot, mais um serviço em Python que calcula a rota mais rápida com um modelo de machine learning.
 
-## Estado atual
+O cliente cria uma conta, monta o pedido com os itens de um restaurante, paga e pede a entrega. Um operador conduz a entrega até o fim e calcula a rota. O pagamento, a cidade e o trânsito são simulados: o foco do projeto está na integração entre os serviços, e não no domínio de delivery.
 
-O User Service cadastra e consulta perfis e endereços em PostgreSQL próprio. O nome e os endereços podem ser atualizados; o e-mail é normalizado, único e imutável nesta etapa. Os endereços são consultados pelo par usuário/endereço. O cadastro com senha, login e consulta da identidade por JWT estão implementados. Perfis, endereços e pedidos exigem Bearer token e só atendem o próprio dono. Só o User assina os tokens (RS256); os outros serviços validam com a chave pública que ele publica. Contas se cadastram como clientes, e um único operador, provisionado pelo `.env`, altera o catálogo e opera as entregas. O login limita as tentativas por conta. Veja [perfis, validação e persistência de usuários](docs/user-profiles.md), [autenticação e configuração da chave](docs/authentication.md) , [autorização dos recursos](docs/resource-authorization.md) e [papéis, chaves assimétricas e limite de login](docs/security-hardening.md).
+## Arquitetura
 
-O Catalog Service cadastra e consulta restaurantes e seus itens de cardápio em PostgreSQL, com migrations Flyway, validação de entrada, paginação e testes de integração com Testcontainers. Um restaurante tem UUID, nome obrigatório e indicador `active`; o cadastro gera o UUID e inicia o restaurante ativo.
+```mermaid
+flowchart LR
+    Web[Frontend React] --> GW[API Gateway]
+    GW --> User[User]
+    GW --> Catalog[Catalog]
+    GW --> Order[Order]
+    GW --> Payment[Payment]
+    GW --> Delivery[Delivery]
 
-A localização de coleta pode ser informada no cadastro ou atualizada depois. Ela contém latitude e longitude e é salva no PostgreSQL. Restaurantes sem localização continuam válidos no catálogo; esse dado é exigido na primeira solicitação de entrega de um pedido.
+    Order -- HTTP --> Catalog
+    Order -- HTTP --> Payment
+    Payment -- HTTP --> Order
+    Order -. evento via outbox .-> MQ[(RabbitMQ)]
+    MQ -.-> Delivery
+    Delivery -- HTTP --> Routes[Route Intelligence<br/>Python]
 
-Cada item do cardápio pertence a um restaurante e tem nome, descrição opcional, preço em BRL e disponibilidade. A API permite cadastrar, consultar, listar e substituir seus dados, com valores monetários exatos e isolamento por restaurante. Veja o [contrato do cardápio](docs/restaurant-menu.md).
+    User --- UDB[(PostgreSQL)]
+    Catalog --- CDB[(PostgreSQL)]
+    Order --- ODB[(PostgreSQL)]
+    Payment --- PDB[(PostgreSQL)]
+    Delivery --- DDB[(PostgreSQL)]
+```
 
-O Order Service cria, consulta, paga e cancela pedidos em um PostgreSQL próprio. Cada pedido pertence ao cliente do token usado na criação, e somente ele pode consultá-lo ou alterá-lo. Na criação, consulta restaurante e itens no catálogo, exige disponibilidade e salva nomes, preços unitários e quantidades, junto ao total em BRL. Mudanças posteriores no cardápio preservam esses valores. O pedido é confirmado por um [pagamento simulado aprovado](docs/order-payment-integration.md), cobrado pelo total sem duplicar a cobrança; um pedido confirmado pode solicitar entrega, com validação da coleta no catálogo, snapshots persistidos e um evento publicado no RabbitMQ pelo outbox, que o Delivery consome de forma idempotente. Veja os [itens e preços dos pedidos](docs/order-items.md) e a [integração entre pedidos e entregas](docs/order-delivery-integration.md).
+| Serviço | O que faz | Porta |
+| --- | --- | --- |
+| API Gateway | Roteia as chamadas e cria o `X-Request-Id`. Não tem regra de negócio | 8080 |
+| User | Cadastro, login, perfis e endereços. É o único que emite tokens JWT | 8081 |
+| Catalog | Restaurantes, cardápio, preços e disponibilidade | 8082 |
+| Order | Pedidos e totais; coordena pagamento e entrega | 8083 |
+| Payment | Tentativas de pagamento simuladas, idempotentes por chave | 8084 |
+| Delivery | Entregas, entregadores, ciclo da entrega e plano de rota | 8085 |
+| Route Intelligence | Prevê o tempo de cada trecho e roda Dijkstra sobre um grafo sintético | 8000 |
 
-O Delivery Service cria e consulta entregas e entregadores por HTTP, com persistência em PostgreSQL. Cada entrega só aparece para o cliente que a pediu e para o operador, que também a lista e opera. A API permite atribuir entregador, registrar coleta, partida, chegada, conclusão e cancelamento antes da coleta. Consulta Python, salva o último plano de rota e registra [travessias simuladas por trecho](docs/delivery-segment-observations.md), com snapshots da previsão e exportação CSV por disponibilidade temporal. Veja também o [planejamento de rotas](docs/delivery-route-integration.md), o [contrato e os exemplos da API](docs/delivery-lifecycle.md), o [domínio de entregas](docs/delivery-domain.md) e a [configuração do banco](docs/delivery-persistence.md).
+Cada serviço Java tem seu próprio banco, build Maven e migrations, e nenhum lê a tabela de outro. Por dentro, todos seguem as mesmas camadas: `domain` (regras em Java puro), `application` (casos de uso e portas), `api` (controllers e DTOs) e `infrastructure` (JPA, clientes HTTP e mensageria).
 
-Os cinco serviços Java mantêm seus endpoints `/ping` e roteamento HTTP pelo Gateway. As seis aplicações Java expõem Actuator. O Payment Service registra [tentativas de pagamento simuladas](docs/simulated-payments.md), com aprovação ou recusa fixadas pelo método, idempotência e PostgreSQL próprio; antes de cobrar, confere o pedido no Order Service. A [solicitação de entrega](docs/delivery-messaging.md) passa pelo RabbitMQ: Order grava o evento em um outbox na mesma transação do pedido e o publica com confirmação do broker; Delivery o consome de forma idempotente, com retry e fila de mensagens mortas.
+## Do pedido à entrega
 
-A [interface web](docs/frontend-foundation.md), em React e TypeScript, permite criar conta, entrar e consultar o perfil autenticado. Ela chama somente o Gateway, sob `/api` na mesma origem, e encerra a sessão quando o token de 15 minutos expira. O [checkout](docs/frontend-checkout.md) cobre restaurantes, cardápio, carrinho, destino, pedido e pagamento simulado. As [entregas](docs/frontend-deliveries.md) são solicitadas e acompanhadas na página do pedido, com a rota prevista no mapa da cidade sintética e um painel que simula o ciclo operacional. A [observabilidade das requisições](docs/request-observability.md) correlaciona cada chamada por `X-Request-Id` em todos os serviços, com uma linha de log por requisição e métricas do fluxo e do roteamento no Actuator. A [validação da promoção](docs/model-promotion-validation.md) gera uma coleta simulada que cobre o grafo e só permite à API servir um modelo observacional depois de uma decisão aprovada sobre contrato, cobertura e métricas. O [acabamento visual](docs/frontend-polish.md) cobre o fluxo do cliente e o console do operador. A [validação da release V1](docs/v1-release-validation.md) percorre esse fluxo no navegador com Playwright, como cliente e como operador, e registra falhas cobertas, limites conhecidos e o checklist de release.
+```mermaid
+sequenceDiagram
+    actor C as Cliente
+    participant O as Order
+    participant Cat as Catalog
+    participant P as Payment
+    participant MQ as RabbitMQ
+    participant D as Delivery
 
-Route Intelligence possui aplicação FastAPI, configuração por ambiente, `/health`, testes e dependências travadas. Já calcula rotas em um grafo sintético com Dijkstra e tempos fixos de referência, por um comando de terminal. A [API de rotas previstas](docs/intelligent-routing-api.md) combina o modelo em lote com Dijkstra. Delivery já consulta essa API e persiste o plano por entrega. Veja a [execução do serviço Python](docs/route-intelligence-foundation.md) e a [demonstração de roteamento](docs/road-graph.md).
+    C->>O: POST /api/orders
+    O->>Cat: restaurante e itens
+    O-->>C: 201 (preços copiados do catálogo)
+    C->>O: POST /api/orders/{id}/payment + Idempotency-Key
+    O->>P: cobrança com a mesma chave
+    P->>O: confere pedido e valor
+    O-->>C: 200 (pedido confirmado)
+    C->>O: POST /api/orders/{id}/delivery
+    Note over O: pedido + evento no outbox,<br/>na mesma transação
+    O-->>C: 202 Accepted
+    O->>MQ: publica com confirmação do broker
+    MQ->>D: entrega o evento
+    Note over D: INSERT ... ON CONFLICT DO NOTHING
+```
 
-O gerador offline já produz observações sintéticas por trecho, com seed, timestamps de disponibilidade, schema de features, partições temporais por cenário e manifesto com checksums. Os dados completos são gerados localmente e ficam fora do Git. Veja [como gerar e conferir o dataset](docs/route-segment-dataset.md).
+## Decisões principais
 
-O treinamento offline compara Dummy, regressão linear, Random Forest e referência física, seleciona pela validação e avalia o modelo salvo no teste reservado. O predictor em lote valida entradas e tempos e é carregado uma vez por processo na API. Veja [treinamento, resultados e artefatos](docs/route-segment-model.md), incluindo a validação nativa no Windows e a compatibilidade por plataforma.
+- **Outbox transacional.** O pedido de entrega e o evento são gravados na mesma transação, e um publicador agendado envia o evento ao RabbitMQ com *publisher confirms*. Se o broker cair, o evento espera no banco. [Detalhes](docs/delivery-messaging.md)
+- **Consumidor idempotente, retry e DLQ.** A entrega é única por pedido, então uma mensagem repetida não cria outra entrega. Falhas passageiras têm 3 tentativas com backoff; mensagens inválidas vão direto para a fila de mensagens mortas.
+- **Pagamento idempotente.** O Order grava a intenção antes de chamar o Payment, e o Payment usa a `Idempotency-Key` com constraints únicas. Repetir a chamada com a mesma chave nunca cobra duas vezes. [Detalhes](docs/order-payment-integration.md)
+- **Concorrência otimista.** `@Version` em pedidos e entregas: uma escrita baseada em versão antiga recebe `409`.
+- **JWT RS256.** Só o User tem a chave privada. Os outros serviços validam o token com a chave pública publicada em `/.well-known/jwks.json` (OAuth2 Resource Server). [Detalhes](docs/security-hardening.md)
+- **Rastreio por `X-Request-Id`.** O id criado no Gateway passa por todos os serviços, inclusive pelo RabbitMQ, e aparece em cada linha de log. Métricas do outbox, do consumo e do roteamento ficam no Actuator. [Detalhes](docs/request-observability.md)
+- **Rotas com ML.** Uma Random Forest (scikit-learn), treinada offline com dados sintéticos, prevê o tempo de cada trecho, e o Dijkstra escolhe o caminho. [Detalhes](docs/route-intelligence.md)
 
-## Evolução para AI Engineering
+## Stack
 
-A consulta `POST /api/routes/fastest` retorna o caminho de menor tempo previsto, com prontidão dos recursos e falhas controladas. Delivery integra e persiste o plano e associa as previsões aos tempos observados em travessias simuladas. O perfil `demo` do Compose executa o fluxo completo em containers, com modelo Linux montado somente para leitura e treinamento offline. Java continua cuidando das transações. A [avaliação offline dos CSVs](docs/segment-observation-evaluation.md) valida os exports e produz métricas das previsões armazenadas, com cortes de disponibilidade e proveniência. A [preparação das observações](docs/segment-observation-dataset.md) cria partições temporais por entrega, com manifesto e carregamento validado próprios. O [treinamento dessas observações](docs/segment-observation-training.md) seleciona um modelo na validação e o avalia no teste reservado, com bundle exclusivo para uso offline. Publicação desse modelo na API é uma evolução posterior.
+Java 21, Spring Boot 4.1, Spring Cloud Gateway, Spring Data JPA, Spring Security, Spring AMQP, PostgreSQL 17, Flyway, RabbitMQ 4.1 · Python 3.12, FastAPI, scikit-learn · React 19, TypeScript, Vite · JUnit 5, AssertJ, Mockito, Testcontainers, pytest, Vitest, Playwright · Docker Compose, GitHub Actions
 
-A [integração de rotas com Delivery](docs/delivery-route-integration.md) está implementada. Grafo e observações são fictícios e não representam ruas ou trânsito reais. Python não é necessário para executar os serviços Java.
+## Como rodar
 
-- [Arquitetura de Route Intelligence e domínio de Delivery](docs/route-intelligence.md).
-- [Contrato HTTP Java ↔ Python](docs/route-intelligence-contract.md).
-- [Dados, prevenção de leakage e avaliação dos modelos](docs/route-intelligence-data.md).
-- [Roadmap por feature branch](docs/roadmap.md).
+Só é preciso Docker com Compose v2. No Linux, os scripts `.ps1` também pedem o PowerShell 7 (`pwsh`).
 
-## Demonstração em containers
+```bash
+cp -n .env.example .env
+scripts/initialize-auth-secret.sh                   # gera a chave RSA e a conta do operador
+pwsh -NoProfile -File scripts/prepare-route-model.ps1   # treina o modelo de rotas (só na primeira vez)
+docker compose --profile demo up -d --build --wait --wait-timeout 600
+pwsh -NoProfile -File scripts/seed-demo-catalog.ps1     # restaurantes e cardápios de exemplo
+```
 
-Com Docker usando containers Linux, execute na raiz:
-
-Se o `.env` já existe, complete as entradas `USER_DB_*` e `RABBITMQ_*` a partir do `.env.example` antes de executar o Compose, preservando a configuração existente e escolhendo uma senha própria para o RabbitMQ.
+<details>
+<summary>No Windows (PowerShell)</summary>
 
 ```powershell
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/initialize-auth-secret.ps1
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts/prepare-route-model.ps1
-docker compose --profile demo up -d --build --wait --wait-timeout 240
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-route-demo.ps1
+docker compose --profile demo up -d --build --wait --wait-timeout 600
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/seed-demo-catalog.ps1
 ```
+</details>
 
-Para ter restaurantes e cardápios na interface, rode `pwsh -NoProfile -File scripts/seed-demo-catalog.ps1` com a demonstração no ar; repetir o comando não duplica dados. O seed e o smoke entram como o operador do `.env`. Para operar as entregas pela interface, entre com `USER_OPERATOR_EMAIL` e `USER_OPERATOR_PASSWORD` do `.env` e abra **Operação**.
+Depois disso:
 
-A interface web atende em `http://localhost:3000`; Gateway em `http://localhost:8080`; Python em `http://localhost:8000`. As portas Java 8081–8085 são internas neste perfil. Sem `demo`, o Compose continua iniciando somente bancos. Não é necessário instalar Java, Python ou Node.js na máquina para esta demonstração. O script verifica um modelo existente e só treina se não houver bundle; a API nunca treina ao iniciar.
+- Interface: http://localhost:3000
+- Gateway: http://localhost:8080
+- RabbitMQ (painel): http://localhost:15672, com as credenciais `RABBITMQ_*` do `.env`
 
-O perfil utiliza cinco bancos, o RabbitMQ, sete aplicações e a interface web, totalizando catorze containers. A interface de gerenciamento do RabbitMQ atende em `http://localhost:15672`, com as credenciais `RABBITMQ_*` do `.env`. Cada JVM usa heap entre 64 e 384 MB e dimensiona seus pools para dois processadores, evitando que as seis aplicações dimensionem memória/threads pelo total da VM Docker. `DEMO_JAVA_TOOL_OPTIONS` permite ajustar esses parâmetros somente no Compose; execução nativa permanece independente.
+Para operar as entregas, entre com `USER_OPERATOR_EMAIL` e `USER_OPERATOR_PASSWORD` do `.env` e abra **Operação**.
 
-Com a demonstração no ar, os testes no navegador rodam com `npm ci`, `npx playwright install chromium` e `npm test` em `e2e/`; veja a [validação da release V1](docs/v1-release-validation.md). Veja o [guia do Compose](docs/route-intelligence-compose.md) para configuração, compatibilidade do modelo, testes de queda/recuperação e preservação dos volumes. O smoke cria registros de demonstração no banco. Os comandos de execução nativa abaixo continuam disponíveis.
+Sem `--profile demo`, o Compose sobe só os bancos e o RabbitMQ, para rodar os serviços pela IDE. Nesse caso, configure o diretório de trabalho como a raiz do repositório, para o Spring ler o `.env`. Os detalhes estão em [execução local](docs/catalog-postgresql.md).
 
-Para verificar cadastro com senha, login, identidade autenticada, perfis e endereços, com User, seu banco e Gateway disponíveis, execute `powershell -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-route-demo.ps1 -UsersOnly`. Para verificar restaurantes e cardápios, use `-CatalogOnly`; para incluir criação, consulta, confirmação e preservação de preços dos pedidos, acrescente Order e seu banco e use `-OrderOnly`. Os três modos são exclusivos e não podem ser combinados com `-CheckRecovery` ou `-CheckPersistence`. O smoke completo verifica perfis e endereços, itens e preços dos pedidos e o fluxo de entrega/rota, incluindo sua preservação após recriar containers quando solicitado.
+## Testes
 
-## Requisitos para desenvolvimento e execução nativa
-
-- JDK 21, com `JAVA_HOME` configurado e `java` disponível no terminal.
-- PowerShell para os exemplos abaixo.
-- Docker com suporte a containers Linux e Docker Compose v2, em execução, para os bancos locais e os testes de integração de usuários, catálogo, pedidos e entregas.
-- Acesso à internet na primeira execução para baixar Maven, dependências e a imagem PostgreSQL.
-- Para Route Intelligence: Python 3.12+ e `uv`; a versão de referência é 3.12. A preparação está no [guia do serviço Python](docs/route-intelligence-foundation.md).
-- Para a interface web: Node.js 22.22+ e npm. Os comandos estão na [base da interface web](docs/frontend-foundation.md).
-
-### Linux
-
-Os comandos PowerShell desta documentação têm equivalentes diretos em Bash. Use `./mvnw` no lugar de `mvnw.cmd` e `/` como separador; os wrappers são versionados como executáveis. O usuário precisa acessar o daemon Docker sem `sudo`, inclusive para os testes com Testcontainers (`docker info` deve funcionar no terminal da IDE). Para isso, adicione-o ao grupo `docker` uma vez e entre novamente na sessão; com o pacote snap, crie o grupo e reinicie o daemon:
+Cada serviço Java tem testes de domínio, de casos de uso, de persistência e de API. Os testes de banco e de mensageria sobem PostgreSQL e RabbitMQ reais com Testcontainers, então precisam do Docker.
 
 ```bash
-sudo addgroup --system docker   # o pacote apt já cria o grupo
-sudo usermod -aG docker "$USER"
-sudo snap disable docker && sudo snap enable docker   # somente no Docker instalado por snap
+./services/order-service/mvnw -f services/order-service/pom.xml verify
 ```
 
-`newgrp docker` aplica o grupo apenas ao terminal atual; depois de sair e entrar na sessão, ele vale para todos. Para o `.env` e as chaves de autenticação:
+O CI ([`ci.yml`](.github/workflows/ci.yml)) roda os seis builds Java, o Python (ruff + pytest) e o frontend (lint + Vitest). Se tudo passar, ele sobe os 14 contêineres e roda:
 
-```bash
-[ -f .env ] || cp .env.example .env
-chmod 600 .env
-scripts/initialize-auth-secret.sh
-docker compose up -d --wait catalog-db order-db delivery-db user-db payment-db rabbitmq
-./services/user-service/mvnw -f services/user-service/pom.xml clean verify
-./services/user-service/mvnw -f services/user-service/pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-```
+- um smoke que derruba o RabbitMQ e o serviço Python no meio do fluxo e confere a recuperação ([`smoke-route-demo.ps1`](scripts/smoke-route-demo.ps1));
+- os testes no navegador com Playwright ([`e2e/`](e2e)).
 
-O script Bash segue as mesmas regras do `.ps1`: preserva uma chave existente, recusa entradas duplicadas e não exibe o valor. Um `.env` copiado do Windows pode manter finais de linha CRLF; Compose e Spring os aceitam, mas `sed -i 's/\r$//' .env` os normaliza. Os scripts de preparação do modelo e de smoke continuam em PowerShell e exigem `pwsh` (PowerShell 7) no Linux, por exemplo `sudo snap install powershell --classic`, chamado como `pwsh -NoProfile -File scripts/smoke-route-demo.ps1`. Em 06/10/2026 o smoke completo, com `-CheckRecovery -CheckPersistence`, passou no Ubuntu com PowerShell 7.6. Em 10/10/2026 o script de preparação do modelo também treinou o bundle do zero no Ubuntu; no Linux ele executa os containers com o UID e o GID de quem o chama, e os arquivos gerados ficam com o dono correto.
-
-Cada aplicação Java inclui o Maven Wrapper; não é necessário instalar Maven separadamente. Versões da base: Spring Boot 4.1.1 e Spring Cloud 2025.1.3 no Gateway. Usuários, catálogo, pedidos e entregas usam as versões de Spring Data JPA, PostgreSQL JDBC, Flyway e Testcontainers geridas pelo Spring Boot; os bancos locais e os testes usam PostgreSQL 17.
+Veja a [validação da V1](docs/v1-release-validation.md).
 
 ## Estrutura
 
 ```text
-deliveryOrderSystem/
-├── api-gateway/
-├── services/
-│   ├── user-service/
-│   ├── catalog-service/
-│   ├── order-service/
-│   ├── payment-service/
-│   ├── delivery-service/
-│   └── route-intelligence-service/
-├── compose.yaml
-├── Dockerfile.java
-├── .env.example
-├── scripts/
-└── docs/
-    └── architecture.md
+api-gateway/                 Spring Cloud Gateway
+services/
+  user-service/              autenticação e perfis
+  catalog-service/           restaurantes e cardápio
+  order-service/             pedidos, outbox
+  payment-service/           pagamentos simulados
+  delivery-service/          entregas e rotas
+  route-intelligence-service/  Python: modelo e Dijkstra
+frontend/                    React + TypeScript
+e2e/                         Playwright
+scripts/                     .env, modelo, seed e smoke
+docs/                        documentação por assunto
+compose.yaml  Dockerfile.java
 ```
 
-Cada aplicação Java possui `pom.xml`, Maven Wrapper, código e testes próprios. Não há um build Maven agregador na raiz. O serviço Python possui `pyproject.toml`, `uv.lock` e testes com pytest, sem dependência do build Maven.
+## Limites conhecidos
 
-## Portas e endpoints
+- Pagamento, ruas, trânsito e entregadores são simulados. A cidade tem 7 pontos, e um destino fora deles cria o pedido, mas fica sem rota.
+- Só a solicitação de entrega é assíncrona. O status da entrega não volta ao pedido por evento, não existe estorno e a DLQ não é reprocessada automaticamente.
+- Catálogo e perfis não têm controle de versão: a última gravação vence.
+- O limite de tentativas de login fica em memória, por instância. Não há refresh token, e existe um único operador.
+- É um ambiente local de demonstração: sem TLS, sem deploy e com credenciais no `.env`.
 
-| Aplicação | Porta | Endpoint de demonstração |
-| --- | --- | --- |
-| API Gateway | 8080 | Encaminha os endpoints abaixo |
-| User Service | 8081 | `/api/users/ping` |
-| Catalog Service | 8082 | `/api/catalog/ping` |
-| Order Service | 8083 | `/api/orders/ping` |
-| Payment Service | 8084 | `/api/payments/ping` |
-| Delivery Service | 8085 | `/api/deliveries/ping` |
-| Route Intelligence | 8000 | `/health` e `POST /api/routes/fastest`, acesso direto |
+## Documentação
 
-As portas da tabela são as portas de execução nativa e as portas internas dos containers. Todas as aplicações Java expõem `/actuator/health` e `/actuator/info` em sua própria porta. O endpoint `info` pode retornar `{}`. O health do Gateway informa a saúde dele, não a de todos os serviços. Os endpoints de saúde de usuários, catálogo, pedidos e entregas incluem a conexão com seus bancos. O `/health` do Python retorna `200 UP` somente com grafo, modelo e tráfego compatíveis; sem esses recursos retorna `503 DOWN`. Python não é encaminhado pelo Gateway.
-
-## PostgreSQL e configuração local
-
-Execute os comandos desta documentação a partir da raiz do repositório. Confira se o Docker está disponível e se o daemon está funcionando:
-
-```powershell
-docker version
-docker info
-docker compose version
-```
-
-Crie a configuração local sem sobrescrever um arquivo existente:
-
-```powershell
-if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-powershell -NoProfile -ExecutionPolicy Bypass -File scripts/initialize-auth-secret.ps1
-```
-
-O `.env.example` contém somente valores de desenvolvimento. Ajuste o `.env` antes de iniciar o banco; ele é ignorado pelo Git e não deve conter credenciais de produção. Use entradas simples `CHAVE=valor`, sem `export` ou aspas, pois o Compose e o Spring leem o mesmo arquivo.
-
-| Variável | Uso local |
+| Assunto | Documentos |
 | --- | --- |
-| `CATALOG_DB_URL` | JDBC do catálogo; padrão `jdbc:postgresql://localhost:5432/catalog` |
-| `CATALOG_DB_USERNAME` | Usuário do banco; padrão `catalog` |
-| `CATALOG_DB_PASSWORD` | Senha local obrigatória, definida no `.env` ou no ambiente |
-| `CATALOG_DB_PORT` | Porta publicada pelo Compose; padrão `5432` |
-| `ORDER_DB_URL` | JDBC de pedidos; padrão `jdbc:postgresql://localhost:5434/orders` |
-| `ORDER_DB_USERNAME` | Usuário do banco de pedidos; padrão `orders` |
-| `ORDER_DB_PASSWORD` | Senha local obrigatória para iniciar o banco e o serviço de pedidos |
-| `ORDER_DB_PORT` | Porta de pedidos publicada pelo Compose; padrão `5434` |
-| `DELIVERY_DB_URL` | JDBC de entregas; padrão `jdbc:postgresql://localhost:5435/deliveries` |
-| `DELIVERY_DB_USERNAME` | Usuário do banco de entregas; padrão `deliveries` |
-| `DELIVERY_DB_PASSWORD` | Senha local obrigatória para iniciar o banco e o serviço de entregas |
-| `DELIVERY_DB_PORT` | Porta de entregas publicada pelo Compose; padrão `5435` |
-| `USER_DB_URL` | JDBC de usuários; padrão `jdbc:postgresql://localhost:5436/users` |
-| `USER_DB_USERNAME` | Usuário do banco de usuários; padrão `users` |
-| `USER_DB_PASSWORD` | Senha local obrigatória para iniciar o banco e o serviço de usuários |
-| `USER_DB_PORT` | Porta de usuários publicada pelo Compose; padrão `5436` |
-| `PAYMENT_DB_URL` | JDBC de pagamentos; padrão `jdbc:postgresql://localhost:5437/payments` |
-| `PAYMENT_DB_USERNAME` | Usuário do banco de pagamentos; padrão `payments` |
-| `PAYMENT_DB_PASSWORD` | Senha local obrigatória para iniciar o banco e o serviço de pagamentos |
-| `PAYMENT_DB_PORT` | Porta de pagamentos publicada pelo Compose; padrão `5437` |
-| `USER_AUTH_PRIVATE_KEY` | Chave RSA que assina os tokens, PKCS#8 em Base64 com pelo menos 2048 bits; obrigatória, gerada pelo script acima |
-| `USER_OPERATOR_EMAIL`, `USER_OPERATOR_PASSWORD` | Conta do operador, criada pelo User ao iniciar; geradas pelo script acima |
-| `USER_AUTH_JWK_SET_URI` | Onde Order, Payment, Catalog e Delivery buscam a chave pública; padrão `http://localhost:8081/.well-known/jwks.json` |
-| `DEMO_JAVA_TOOL_OPTIONS` | Opções opcionais das seis JVMs no perfil `demo`; padrão `-Xms64m -Xmx384m -XX:ActiveProcessorCount=2` |
-
-Se a porta 5432 já estiver ocupada, escolha outra porta em `CATALOG_DB_PORT` e ajuste também `CATALOG_DB_URL`. A mesma regra vale para pedidos, entregas, usuários e pagamentos. Se você já possui `.env`, acrescente as entradas `ORDER_DB_*`, `DELIVERY_DB_*`, `USER_DB_*` e `PAYMENT_DB_*` que faltarem em relação a `.env.example`, sem substituir os valores existentes. Variáveis de ambiente podem sobrescrever os valores do arquivo. O Compose exige as senhas dos cinco bancos e `USER_AUTH_SECRET` ao resolver sua configuração, mesmo que o comando selecione somente um deles. O script de chave preserva um valor já configurado e nunca o exibe; mantenha a mesma chave entre reinícios.
-
-O Compose define `catalog-db`, `order-db`, `delivery-db`, `user-db` e `payment-db`, com `postgres:17-alpine`, portas publicadas em `127.0.0.1` e health check `pg_isready`. Os volumes são separados: `catalog_postgres_data`, `order_postgres_data`, `delivery_postgres_data`, `user_postgres_data` e `payment_postgres_data`. Para iniciar os cinco:
-
-```powershell
-docker compose up -d --wait catalog-db order-db delivery-db user-db payment-db rabbitmq
-docker compose ps
-```
-
-Os bancos se chamam `catalog`, `orders`, `deliveries`, `users` e `payments`. Cada aplicação com persistência importa opcionalmente `.env` do diretório de execução e exige sua senha para se conectar. Ao iniciar cada serviço, Flyway aplica as migrations em seu `src/main/resources/db/migration`; Hibernate apenas valida o schema (`ddl-auto=validate`). `open-in-view` fica desabilitado.
-
-O volume preserva os dados entre reinícios. Alterar usuário ou senha no `.env` não altera as credenciais de um banco já inicializado; use os valores correspondentes ao volume existente. Para interromper o banco preservando seus dados:
-
-```powershell
-docker compose stop catalog-db
-docker compose stop order-db
-docker compose stop delivery-db
-docker compose stop user-db
-docker compose stop payment-db
-```
-
-Não remova o volume para executar ou testar esta etapa. Os testes usam um banco descartável separado, criado pelo Testcontainers.
-
-## Executar localmente
-
-Para trabalhar com restaurantes e cardápios, basta iniciar `catalog-db` e abrir dois terminais na raiz:
-
-```powershell
-# Terminal 1: o diretório explícito faz o Spring carregar o .env da raiz
-.\services\catalog-service\mvnw.cmd -f .\services\catalog-service\pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-# Terminal 2
-.\api-gateway\mvnw.cmd -f .\api-gateway\pom.xml spring-boot:run
-```
-
-Os demais serviços continuam disponíveis, um comando por terminal:
-
-```powershell
-.\services\user-service\mvnw.cmd -f .\services\user-service\pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-.\services\order-service\mvnw.cmd -f .\services\order-service\pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-.\services\payment-service\mvnw.cmd -f .\services\payment-service\pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-.\services\delivery-service\mvnw.cmd -f .\services\delivery-service\pom.xml "-Dspring-boot.run.workingDirectory=$PWD" spring-boot:run
-```
-
-O User Service exige `USER_AUTH_PRIVATE_KEY` e `user-db` em execução, Order exige `order-db`, Payment exige `payment-db` e Delivery exige `delivery-db`. Order, Payment, Catalog e Delivery validam tokens com o JWKS do User em `localhost:8081`. Use `Ctrl+C` em cada terminal para encerrar a aplicação. As portas precisam estar livres. Ao executar usuários, catálogo, pedidos ou entregas pela IDE, configure o diretório de trabalho como a raiz do repositório ou forneça as variáveis de ambiente ao processo.
-
-## Cadastrar perfis e endereços
-
-A API atende diretamente em `http://localhost:8081` ou pelo Gateway em `http://localhost:8080`. O perfil é criado por `POST /api/users/auth/register`; as demais requisições exigem `Authorization: Bearer <token>` do próprio usuário, e recursos de outra pessoa retornam `404`:
-
-| Requisição | Resultado |
-| --- | --- |
-| `GET /api/users/{id}` | `200` com perfil ou `404` |
-| `PUT /api/users/{id}/profile` com `{name}` | `200`, preservando UUID e e-mail |
-| `POST /api/users/{userId}/addresses` | `201`, endereço criado e cabeçalho `Location` |
-| `GET /api/users/{userId}/addresses?page=0&size=20` | `200` com página de endereços |
-| `GET/PUT /api/users/{userId}/addresses/{addressId}` | `200` com endereço consultado ou substituído; `404` se ausente ou de outro usuário |
-
-O endereço recebe `label`, `address`, `latitude` e `longitude`. Nome, rótulo e endereço são obrigatórios, com limites de 120, 80 e 255 caracteres. E-mail é normalizado para minúsculas e deve seguir o formato ASCII definido no contrato; duplicidade retorna `409`. Formato válido não comprova propriedade do e-mail. Pedidos continuam recebendo seu próprio destino, sem referência a um endereço salvo.
-
-Veja [contrato, exemplos e testes de usuários](docs/user-profiles.md). Para criar uma conta com senha, use `POST /api/users/auth/register`; `POST /api/users/auth/login` retorna um Bearer JWT de 15 minutos e `GET /api/users/auth/me` consulta a identidade autenticada. Perfis sem credenciais não recebem senha padrão nem podem ser assumidos por outro cadastro. Catálogo e entregas ainda são públicos. Veja [autenticação](docs/authentication.md) e [autorização](docs/resource-authorization.md).
-
-## Criar e acompanhar entregas
-
-A API atende diretamente em `http://localhost:8085` ou pelo Gateway em `http://localhost:8080`, sob `/api/deliveries`. Ela inclui cadastro de entregadores em `/api/deliveries/couriers`, criação de entregas, consulta por entrega/pedido e comandos do ciclo. Os horários são gerados pelo servidor; comandos repetidos retornam `409`.
-
-Delivery também oferece `POST` e `GET /api/deliveries/{id}/route` para planejar e consultar a rota. A nova previsão exige Python com modelo compatível; falhas preservam o plano anterior. Veja [configuração e exemplos de planejamento](docs/delivery-route-integration.md).
-
-Veja [o contrato, exemplos completos e validação de entregas](docs/delivery-lifecycle.md). Para criar a entrega com dados do pedido e do catálogo, use a [solicitação de entrega de um pedido confirmado](docs/order-delivery-integration.md).
-
-## Criar e acompanhar pedidos
-
-Diretamente em `http://localhost:8083` ou pelo Gateway em `http://localhost:8080`:
-
-| Requisição | Resultado |
-| --- | --- |
-| `POST /api/orders` | `201`, pedido criado e cabeçalho `Location` |
-| `GET /api/orders/{id}` | `200` com o pedido ou `404` |
-| `POST /api/orders/{id}/payment` com `Idempotency-Key` e `{method}` | `200` com o pagamento simulado; aprovação confirma o pedido |
-| `POST /api/orders/{id}/cancel` | `200` com estado `CANCELLED`; `409` com pagamento em andamento ou aprovado |
-| `POST /api/orders/{id}/delivery` | `202` com `orderId` e `status: "REQUESTED"`; exige pedido confirmado. A entrega é criada pelo Delivery ao consumir o evento |
-
-O cadastro recebe `restaurantId`, `destination` com `address`, `latitude` e `longitude`, e `items` com `menuItemId` e `quantity`. São aceitos de 1 a 50 itens distintos, com quantidades inteiras de 1 a 99. O servidor consulta o catálogo e calcula os valores; preços enviados pelo cliente não definem o total. Ausência de restaurante ou item, restaurante inativo ou item de outro restaurante/indisponível resulta em `409`; falhas do catálogo retornam `503` sem detalhes internos. A resposta inclui os itens com nomes e preços preservados, `lineTotal`, `total` e `currency: "BRL"`. Pedidos anteriores à migração mantêm `items: []`, `total: null` e `currency: null`.
-
-O pedido só é confirmado por um pagamento simulado aprovado; o valor cobrado é o total do pedido, e repetir a mesma `Idempotency-Key` não cobra de novo. Veja [pagamento de pedidos](docs/order-payment-integration.md). Repetir um cancelamento já aplicado preserva os timestamps e a composição do pedido. Conflitos de atualização retornam `409`; consulte o pedido antes de tentar novamente.
-
-Veja [o fluxo, exemplos completos e testes de pedidos](docs/orders.md).
-
-## Cadastrar e consultar restaurantes
-
-O mesmo contrato atende diretamente em `http://localhost:8082` e pelo Gateway em `http://localhost:8080`. A rota existente `/api/catalog/**` preserva o caminho completo.
-
-| Requisição | Resultado |
-| --- | --- |
-| `POST /api/catalog/restaurants` com `{"name":"Restaurante Central"}` | `201 Created`, corpo com `id`, `name`, `active`, `pickupLocation` e cabeçalho `Location` |
-| `GET /api/catalog/restaurants/{id}` | `200 OK` com o restaurante ou `404 Not Found` |
-| `GET /api/catalog/restaurants?page=0&size=20` | `200 OK` com página de restaurantes |
-| `PUT /api/catalog/restaurants/{id}/pickup-location` | `200 OK` com o restaurante e a localização atualizada |
-
-O nome é obrigatório, não pode conter apenas espaços e aceita até 120 caracteres. Espaços nas extremidades são removidos. UUID e estado ativo são definidos pelo servidor. `pickupLocation` é opcional no cadastro; quando informado, exige os dois números: `latitude` entre -90 e 90 e `longitude` entre -180 e 180. Os limites são inclusivos, e strings numéricas, `NaN` e infinitos não são aceitos.
-
-Exemplo completo em PowerShell, executado primeiro diretamente e depois pelo Gateway. Cada execução cria um restaurante no banco local:
-
-```powershell
-foreach ($baseUrl in @('http://localhost:8082', 'http://localhost:8080')) {
-    $created = Invoke-WebRequest -UseBasicParsing -Method Post `
-        -Uri "$baseUrl/api/catalog/restaurants" `
-        -ContentType 'application/json' -Body '{"name":"Restaurante Central"}'
-    $created.StatusCode # 201
-    $created.Headers['Location'] # /api/catalog/restaurants/{UUID}
-    $restaurant = $created.Content | ConvertFrom-Json
-    $restaurant # id, name, active=true e pickupLocation
-    Invoke-RestMethod "$baseUrl/api/catalog/restaurants/$($restaurant.id)"
-    Invoke-RestMethod "$baseUrl/api/catalog/restaurants?page=0&size=20"
-}
-```
-
-A página começa em zero; `page` deve ser não negativo e `size` deve estar entre 1 e 100. Os valores padrão são `page=0` e `size=20`. Para respeitar o limite de offset do JPA, `page * size` não pode ultrapassar `2147483647`. A ordem é fixa por `name ASC, id ASC`; UUID desempata nomes iguais. Não há parâmetro de ordenação configurável. Uma página sem resultados retorna `content: []`.
-
-Formato da resposta paginada:
-
-```json
-{
-  "content": [
-    {"id":"9d6c1458-0c80-45cd-a9c0-b420f25c8246","name":"Restaurante Central","active":true,"pickupLocation":null}
-  ],
-  "page": 0,
-  "size": 20,
-  "totalElements": 1,
-  "totalPages": 1
-}
-```
-
-Entrada inválida retorna `400 Bad Request`, incluindo nome ausente/em branco, JSON inválido, UUID malformado e paginação fora dos limites. Um UUID válido que não existe retorna `404 Not Found`. Os erros usam `application/problem+json` com `status`, `title` e `detail`; podem incluir os campos padrão `type` e `instance`. Falhas inesperadas retornam `500` com mensagem genérica, sem detalhes internos.
-
-### Localização de coleta
-
-Cadastre um restaurante com localização diretamente ou pelo Gateway:
-
-```powershell
-$baseUrl = 'http://localhost:8080'
-$body = '{"name":"Cantina Central","pickupLocation":{"latitude":-23.5505,"longitude":-46.6333}}'
-$restaurant = Invoke-RestMethod -Method Post -Uri "$baseUrl/api/catalog/restaurants" -ContentType 'application/json' -Body $body
-```
-
-Para informar ou substituir a localização de um restaurante existente:
-
-```powershell
-$location = '{"latitude":-22.9068,"longitude":-43.1729}'
-Invoke-RestMethod -Method Put -Uri "$baseUrl/api/catalog/restaurants/$($restaurant.id)/pickup-location" -ContentType 'application/json' -Body $location
-Invoke-RestMethod "$baseUrl/api/catalog/restaurants/$($restaurant.id)"
-```
-
-O `PUT` recebe as duas coordenadas e devolve o restaurante atualizado. Repetir a mesma requisição mantém o resultado, sem criar outro restaurante. Nome, UUID e estado ativo são preservados. Nesta etapa não há remoção de localização. Entrada inválida retorna `400`, e restaurante inexistente retorna `404`.
-
-As consultas por UUID e por página incluem `pickupLocation`, que será `null` nos restaurantes sem esse dado. A migration `V2__add_restaurant_pickup_location.sql` preserva os registros existentes e mantém as coordenadas vazias até serem informadas. `0,0` é uma coordenada válida e não representa ausência de localização.
-
-Exemplos de erro abaixo geram exceção HTTP no PowerShell, com os status indicados:
-
-```powershell
-# 400: nome inválido
-Invoke-WebRequest -UseBasicParsing -Method Post -Uri 'http://localhost:8082/api/catalog/restaurants' -ContentType 'application/json' -Body '{"name":" "}'
-# 400: tamanho acima do limite
-Invoke-WebRequest -UseBasicParsing 'http://localhost:8082/api/catalog/restaurants?page=0&size=101'
-# 404: UUID inexistente em um banco sem esse registro
-Invoke-WebRequest -UseBasicParsing 'http://localhost:8082/api/catalog/restaurants/00000000-0000-0000-0000-000000000000'
-```
-
-## Verificar pings e Actuator
-
-Com catálogo e Gateway em execução:
-
-```powershell
-Invoke-RestMethod http://localhost:8082/actuator/health
-Invoke-RestMethod http://localhost:8082/actuator/info
-Invoke-RestMethod http://localhost:8082/api/catalog/ping
-Invoke-RestMethod http://localhost:8080/api/catalog/ping
-Invoke-RestMethod http://localhost:8080/actuator/health
-```
-
-O health deve retornar `status: UP`. O ping direto e pelo Gateway deve retornar HTTP 200 e `{"service":"catalog-service","status":"ok"}`.
-
-Para verificar os cinco serviços, com as seis aplicações em execução:
-
-```powershell
-$services = @(
-    @{ Port = 8081; Resource = 'users' },
-    @{ Port = 8082; Resource = 'catalog' },
-    @{ Port = 8083; Resource = 'orders' },
-    @{ Port = 8084; Resource = 'payments' },
-    @{ Port = 8085; Resource = 'deliveries' }
-)
-foreach ($service in $services) {
-    Invoke-RestMethod "http://localhost:$($service.Port)/actuator/health"
-    Invoke-RestMethod "http://localhost:$($service.Port)/api/$($service.Resource)/ping"
-    Invoke-RestMethod "http://localhost:8080/api/$($service.Resource)/ping"
-}
-```
-
-O campo `service` deve identificar o serviço correspondente. Os pings são demonstrações de HTTP, não verificações de regras de negócio.
-
-## Testes e build
-
-O GitHub Actions executa os builds e testes Java, Python e do frontend em cada pull request e em cada push na `main` e, depois deles, sobe o Compose para rodar o smoke completo e os testes no navegador. Veja a [integração contínua](docs/ci-validation.md).
-
-Com Docker funcionando, execute da raiz:
-
-```powershell
-# Testes do catálogo
-.\services\catalog-service\mvnw.cmd -f .\services\catalog-service\pom.xml clean test
-# Testes e JAR executável do catálogo
-.\services\catalog-service\mvnw.cmd -f .\services\catalog-service\pom.xml clean verify
-# Testes e JAR executável de pedidos
-.\services\order-service\mvnw.cmd -f .\services\order-service\pom.xml clean verify
-# Testes e JAR executável de usuários
-.\services\user-service\mvnw.cmd -f .\services\user-service\pom.xml clean verify
-```
-
-Os testes de domínio cobrem perfis, e-mails e endereços, além das regras de restaurantes, cardápios e composição dos pedidos, incluindo preços sem frações de centavo e cálculo exato dos totais. Os testes de integração inicializam Spring e PostgreSQL real via Testcontainers, aplicam Flyway e exercitam cadastro, dados persistidos, consulta, paginação, entrada inválida e recursos inexistentes. Usuários verificam senhas BCrypt, claims/assinatura/expiração JWT, contratos de autenticação, rollback de perfil/credencial, migração dos legados, unicidade de e-mail inclusive em cadastros simultâneos e isolamento dos endereços por perfil; catálogo verifica isolamento dos itens por restaurante. Pedidos usam servidores HTTP locais para testar a consulta ao catálogo, indisponibilidade e preservação dos valores após alterações remotas e transições. As migrations também são testadas sobre dados existentes, preservando pedidos antigos sem inventar preços. Os contextos com persistência usam o banco do Testcontainers. Não é necessário subir o Compose, criar `.env` ou fornecer credenciais locais para esses testes; eles não acessam o volume de desenvolvimento. A suíte completa exige Docker e falha quando ele está indisponível, em vez de ignorar a integração.
-
-O JAR fica em `services/catalog-service/target/catalog-service-0.0.1-SNAPSHOT.jar`. Com o PostgreSQL local iniciado e `.env` configurado, ele também pode ser executado da raiz:
-
-```powershell
-java -jar .\services\catalog-service\target\catalog-service-0.0.1-SNAPSHOT.jar
-```
-
-Para testar todas as aplicações:
-
-```powershell
-$projects = @(
-    'api-gateway',
-    'services/user-service',
-    'services/catalog-service',
-    'services/order-service',
-    'services/payment-service',
-    'services/delivery-service'
-)
-foreach ($project in $projects) {
-    & "$project/mvnw.cmd" -f "$project/pom.xml" clean test
-    if ($LASTEXITCODE -ne 0) { throw "Testes falharam em $project" }
-}
-```
-
-Substitua `clean test` por `clean verify` para também gerar os JARs em `target/` de cada aplicação. Usuários e pedidos têm testes de domínio, HTTP, persistência e concorrência, também com PostgreSQL descartável. Entregas têm testes de domínio, casos de uso, HTTP, erros, persistência e concorrência; a suíte completa exige Docker e usa Testcontainers. Pagamentos têm testes de domínio, persistência, concorrência e HTTP com PostgreSQL descartável. Gateway mantém os testes de inicialização de contexto. As integrações HTTP automatizadas de usuários, catálogo, pedidos e entregas testam diretamente os serviços; confira também o encaminhamento real pelo Gateway usando os exemplos documentados.
-
-Veja o fluxo e as responsabilidades em [docs/architecture.md](docs/architecture.md), os detalhes de persistência em [docs/catalog-postgresql.md](docs/catalog-postgresql.md) e o [registro de validação do catálogo](docs/catalog-validation.md).
+| Arquitetura | [visão geral](docs/architecture.md) · [roadmap](docs/roadmap.md) |
+| Usuários e segurança | [perfis](docs/user-profiles.md) · [autenticação](docs/authentication.md) · [autorização](docs/resource-authorization.md) · [papéis e chaves](docs/security-hardening.md) |
+| Catálogo | [PostgreSQL e execução](docs/catalog-postgresql.md) · [cardápio](docs/restaurant-menu.md) |
+| Pedidos e pagamentos | [pedidos](docs/orders.md) · [itens e preços](docs/order-items.md) · [pagamentos simulados](docs/simulated-payments.md) · [pagamento do pedido](docs/order-payment-integration.md) |
+| Entregas | [domínio](docs/delivery-domain.md) · [ciclo e API](docs/delivery-lifecycle.md) · [persistência](docs/delivery-persistence.md) · [mensageria](docs/delivery-messaging.md) · [pedido → entrega](docs/order-delivery-integration.md) · [rotas](docs/delivery-route-integration.md) |
+| Route Intelligence | [visão geral](docs/route-intelligence.md) · [contrato Java ↔ Python](docs/route-intelligence-contract.md) · [API de rotas](docs/intelligent-routing-api.md) · [modelo](docs/route-segment-model.md) · [Compose](docs/route-intelligence-compose.md) |
+| Frontend | [base](docs/frontend-foundation.md) · [checkout](docs/frontend-checkout.md) · [entregas](docs/frontend-deliveries.md) |
+| Qualidade | [observabilidade](docs/request-observability.md) · [CI](docs/ci-validation.md) · [validação da V1](docs/v1-release-validation.md) |
+
+## Licença
+
+[MIT](LICENSE)
